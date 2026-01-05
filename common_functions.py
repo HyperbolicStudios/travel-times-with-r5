@@ -4,6 +4,26 @@ import requests
 import geopandas as gpd
 import numpy as np
 
+import matplotlib.pyplot as plt
+from scipy.interpolate import Rbf
+from shapely.geometry import box
+import contextily as ctx
+
+def set_modules_to_autoreload():
+    # Source - https://stackoverflow.com/a
+    # Posted by Taytay
+    # Retrieved 2025-12-28, License - CC BY-SA 4.0
+
+    from IPython.core.getipython import get_ipython
+    from IPython.core.interactiveshell import InteractiveShell
+
+    ipython: InteractiveShell|None  = get_ipython()
+    if ipython is not None:
+        ipython.run_line_magic("load_ext", "autoreload")
+        ipython.run_line_magic("autoreload", "2")
+    
+    return
+
 def setup_folders(folder_name, sub_folders=['osm', 'gtfs', 'population']):
     """
     Create a main folder and specified sub-folders if they do not already exist.
@@ -22,12 +42,9 @@ def setup_folders(folder_name, sub_folders=['osm', 'gtfs', 'population']):
     
     return
 
-def generate_point_grid(p1, p2, spacing = 100):
+def generate_points_on_land(p1, p2, spacing = 100):
     #p1 and p2 are WGS-84 points defining the bounding box
     #spacing is the grid spacing in meters
-
-    import geopandas as gpd
-    import pandas as pd
 
     centroid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2]
     print("Centroid:", centroid)
@@ -66,7 +83,19 @@ def generate_point_grid(p1, p2, spacing = 100):
     
     grid_points['id'] = grid_points.index
     print("Generated {} grid points.".format(len(grid_points)))
-    return(grid_points)
+
+    land = gpd.read_file("land-polygons-complete-4326/land_polygons.shp")
+
+    points_extents = gpd.GeoDataFrame(
+        geometry=[box(*grid_points.total_bounds)],
+        crs=grid_points.crs
+    )
+    #clip land to the extent of the grid points
+    land = gpd.clip(land, points_extents)
+
+    grid_points = gpd.clip(grid_points, land)
+
+    return(grid_points, land)
 
 def clear_r5rpy_cache():
     import shutil
@@ -77,7 +106,7 @@ def clear_r5rpy_cache():
 
     return
 
-def download_transitland_feeds_for_area(p1, p2, date, parent_folder):
+def download_transitland_feeds_for_area(p1, p2, date, sub_folder):
     #p1 and p2 are tuples representing (x, y) in WGS-84 coordinates defining the bounding box
     #date is a string in the format "YYYY-MM-DD"
 
@@ -86,11 +115,11 @@ def download_transitland_feeds_for_area(p1, p2, date, parent_folder):
     import os
 
     #clear the gtfs folder
-    if not os.path.exists(parent_folder + "/gtfs"):
-        os.makedirs(parent_folder + "/gtfs")
+    if not os.path.exists(sub_folder):
+        os.makedirs(sub_folder)
     else:
-        for file in os.listdir(parent_folder + "/gtfs"):
-            file_path = os.path.join(parent_folder + "/gtfs", file)
+        for file in os.listdir(sub_folder):
+            file_path = os.path.join(sub_folder, file)
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
@@ -161,7 +190,7 @@ def download_transitland_feeds_for_area(p1, p2, date, parent_folder):
         sha1 = first_row['sha1']
         request = requests.get(base_url + "/feed_versions/" + sha1 + "/download", headers=headers)
 
-        with open(parent_folder + "/gtfs/" + onestop_id + ".zip", 'wb') as f:
+        with open(sub_folder + "/" + date + "_" + onestop_id + ".zip", 'wb') as f:
             f.write(request.content)
          
     return
@@ -195,99 +224,130 @@ def download_topography(p1, p2, parent_folder):
         print("Failed to download topography data. Status code:", response.status_code)
         print("Response:", response.text)
 
+        return
+    
+    # Open the elevation raster (e.g., SRTMGL1) with rasterio.
+    # rasterio reads the raster along with its CRS (coordinate reference system)
+    # and ensures it can be interpreted correctly in Python. 
+    # This helps r5py apply elevation costs without running into projection errors
+    # (like missing Bursa-Wolf parameters or unknown EPSG codes) because
+    # rasterio standardizes the CRS and allows transformations if needed.
+
+    import rasterio
+    from rasterio.crs import CRS
+
+    src = parent_folder + "/topography/topography.tif"
+    dst = parent_folder + "/topography/topography-wgs.tif"
+
+    with rasterio.open(src) as ds:
+        profile = ds.profile.copy()
+        profile["crs"] = CRS.from_epsg(4326)  # Set to WGS84
+
+        with rasterio.open(dst, "w", **profile) as out:
+            out.write(ds.read())
+
     return
 
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.interpolate import Rbf
 
-def plot_interpolated_grid(x, y, z, title, method='linear', grid_size=100, cmap='viridis'):
+
+def plot_interpolated_grid(x, y, z, ax=None, land = None, additional_gdf = None, title = "Interpolated Grid", sub_title = None, zero_centred=False, contours=None, cmap='plasma_r', method='linear', grid_size=100):
     """
     Plot an interpolated 2D grid from scattered x, y, z points using imshow.
-
-    Parameters:
-    -----------
-    x, y, z : array-like
-        Coordinates and values of scattered points.
-    method : str, optional
-        Interpolation method: 'linear', 'nearest', 'cubic' (default: 'cubic').
-    grid_size : int, optional
-        Number of points along each axis for the grid (default: 100).
-    cmap : str, optional
-        Matplotlib colormap (default: 'viridis').
-
-    Returns:
-    --------
-    None
     """
-    x = np.asarray(x)
-    y = np.asarray(y)
-    z = np.asarray(z)
+
+    #convert x, y data to epsg=3857
+    raw_points_gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(x, y), crs="EPSG:4326").to_crs("EPSG:3857")
+    x, y = raw_points_gdf.geometry.x.values, raw_points_gdf.geometry.y.values
+
+    land = land.to_crs("EPSG:3857")
+
+    rbf = Rbf(x, y, z, function=method)
+
+    x_tics, y_tics = np.linspace(x.min(), x.max(), grid_size), np.linspace(y.min(), y.max(), grid_size)
+    x_grid, y_grid = np.meshgrid(x_tics, y_tics)
+    z_grid = rbf(x_grid, y_grid)
     
-    # Create grid over bounds of data
-    xi = np.linspace(x.min(), x.max(), grid_size)
-    yi = np.linspace(y.min(), y.max(), grid_size)
-    X, Y = np.meshgrid(xi, yi)
+    grid_gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(x_grid.flatten(), y_grid.flatten()), crs="EPSG:3857")
     
-    # Interpolate scattered data onto grid
-    f = Rbf(x, y, z, function=method)
-    Z = f(X, Y)
+    land['is_land'] = True
+    #create a mask based on a column called 'is_land' in the land geodataframe
+    grid_gdf = grid_gdf.sjoin(land, how='left', predicate='within')
+    grid_gdf['mask'] = grid_gdf['is_land'].isnull()
+    grid_gdf = grid_gdf[['geometry', 'mask']]
 
-    #determine the aspect ratio of the figure based on p1, p2
+    masked_image = np.ma.masked_array(z_grid, mask=grid_gdf['mask'].values.reshape(x_grid.shape))
 
-    centroid = [(x.min() + x.max()) / 2, (y.min() + y.max()) / 2]
-    print("Centroid:", centroid)
-
-    #find what UTM coordinate system the centroid is in
-    centroid = gpd.GeoDataFrame(geometry=[gpd.points_from_xy([centroid[0]], [centroid[1]])[0]], crs="EPSG:4326")
-    centroid_utm_crs = utm_crs = centroid.estimate_utm_crs()
-
-    print("Estimated UTM CRS:", utm_crs)
-
-    #convert points to UTM
-    bounding_points_gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy([x.min(), x.max()], [y.min(), y.max()]), crs="EPSG:4326")
-    bounding_points_gdf = bounding_points_gdf.to_crs(centroid_utm_crs)
-    print(bounding_points_gdf)
-
-    aspect_ratio = abs((bounding_points_gdf.geometry.y.max() - bounding_points_gdf.geometry.y.min()) / (bounding_points_gdf.geometry.x.max() - bounding_points_gdf.geometry.x.min()))
-    print("Aspect ratio (height/width):", aspect_ratio)
-    
     #add map to background. Show simple streets map from OpenStreetMap
-    import contextily as ctx
-
     
-    plt.figure()
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.figure
 
-    ax = plt.gca()
-    ax.set_xlim(x.min(), x.max())
-    ax.set_ylim(y.min(), y.max())
+    land_points = grid_gdf.loc[~grid_gdf['mask']]
+    ax.set_xlim(land_points.geometry.x.min(), land_points.geometry.x.max())
+    ax.set_ylim(land_points.geometry.y.min(), land_points.geometry.y.max())
 
-    ax.set_box_aspect(aspect=aspect_ratio)
+    print("X limits:", ax.get_xlim())
+    print("Y limits:", ax.get_ylim())
 
-    ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, crs='EPSG:4326')
+    #generate image mask based on land
 
-        # Plot
-    plt.imshow(Z, extent=(x.min(), x.max(), y.min(), y.max()), origin='lower',
-               cmap=cmap, aspect='auto', alpha=0.5)
+    #add basemap
+    ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, crs='EPSG:3857')
 
-    #plt.scatter(x, y, c=z, edgecolor='k', cmap=cmap)  # optional: show original points
-    
-    
-    plt.colorbar(label='Minutes')
-    plt.title(title)
-    plt.show()
+    img = ax.imshow(
+        masked_image,
+        extent=(x_tics.min(), x_tics.max(), y_tics.min(), y_tics.max()),
+        origin='lower',
+        cmap=cmap,
+        vmin= -max(abs(z_grid.min()), abs(z_grid.max())) if zero_centred else z_grid.min(),
+        vmax= max(abs(z_grid.min()), abs(z_grid.max())),
+        alpha=0.4
+    )
 
-    return(plt)
+    #draw contours at the 60 minute mark
+    contour = ax.contour(
+        x_grid,
+        y_grid,
+        z_grid,
+        levels=contours,
+        colors='black',
+        linewidths=1
+    ) if contours is not None else None
 
-"""x = np.linspace(-123, -122, 50)
-y = np.linspace(49, 49.3, 50)
+    #label contours
+    if contours is not None and contours != [0]:
+        ax.clabel(contour, inline=True, fontsize=8, fmt='%1.0f')
 
-z = np.sin((x + 123) * 10) * np.cos((y - 49) * 10)
+    #plot additional gdf if provided
+    if additional_gdf is not None:
+        additional_gdf = additional_gdf.to_crs("EPSG:3857")
+        additional_gdf.plot(ax=ax, color='blue')
 
-plot_interpolated_grid(x, y, z, title="Sample", method='cubic', grid_size=200, cmap='viridis')"""
+    #hide x and y tics
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    #title
+    ax.set_title(title, fontsize=16)
+
+    #remove all padding, we'll control this from the figure level
+    ax.margins(0)
+
+    #add subtitle if provided, just below the title
+    if sub_title is not None:
+        ax.text(0.5, 1.015, sub_title, transform=ax.transAxes, fontsize=12, ha='center')
+        #move the title up by 20
+        ax.set_title("", fontsize=16)
+        ax.set_title(title, fontsize=16, pad=23)
+
+    fig.colorbar(img, ax=ax, label='Minutes', shrink=0.8)
+
+    return fig, ax
 
 def scatter_plot(x,y,z):
-    plt.scatter(x, y, c=z, cmap='viridis')
+    plt.scatter(x, y, c=z, s=5, cmap='plasma_r', )
 
         #determine the aspect ratio of the figure based on p1, p2
 
@@ -315,5 +375,8 @@ def scatter_plot(x,y,z):
     ax.set_box_aspect(aspect=aspect_ratio)
     
     ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron, crs='EPSG:4326')
+
+    #add legend
+    plt.colorbar(label='Minutes')
 
     plt.show()
